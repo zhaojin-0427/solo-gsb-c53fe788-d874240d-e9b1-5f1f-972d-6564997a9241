@@ -93,5 +93,81 @@ class FsTypeConstantTests(unittest.TestCase):
         self.assertEqual(fl.fstype_reserved_bits(0x1000), 0x1000)
 
 
+class NormalizeEvidenceFstypeTests(unittest.TestCase):
+    """读取存证时以数值 fsType 为准重算派生字段（副本，不改原对象）。
+
+    模拟升级前（v1 旧位序）登记的存证：0x0002 被误标 preview-print-only、
+    0x0100 被误标 bitmap-only、保留位按旧掩码 0xFEF1 计算。
+    """
+
+    def _legacy_evidence(self):
+        return {
+            "container": "ttc",
+            "members_complete": True,
+            "unpack_summary": {"container": "ttc", "member_count": 2},
+            "members": [
+                {"member_index": 0, "sha256": "a" * 64, "fstype": 0x0002,
+                 "fstype_flags": [0x0002],
+                 "fstype_flag_labels": ["preview-print-only"],
+                 "fstype_reserved_bits": 0},
+                {"member_index": 1, "sha256": "b" * 64, "fstype": 0x0100,
+                 "fstype_flags": [0x0100],
+                 "fstype_flag_labels": ["bitmap-only"],
+                 "fstype_reserved_bits": 0},
+            ],
+        }
+
+    def test_recompute_covers_all_ttc_members(self):
+        ev = fl.normalize_evidence_fstype(self._legacy_evidence())
+        m0, m1 = ev["members"]
+        self.assertEqual(m0["fstype_flags"], [0x0002])
+        self.assertEqual(m0["fstype_flag_labels"], ["restricted"])
+        self.assertEqual(m0["fstype_reserved_bits"], 0)
+        self.assertEqual(m1["fstype_flags"], [0x0100])
+        self.assertEqual(m1["fstype_flag_labels"], ["no-subsetting"])
+        self.assertEqual(m1["fstype_reserved_bits"], 0)
+
+    def test_original_evidence_not_mutated(self):
+        legacy = self._legacy_evidence()
+        fl.normalize_evidence_fstype(legacy)
+        self.assertEqual(legacy["members"][0]["fstype_flag_labels"],
+                         ["preview-print-only"])
+        self.assertEqual(legacy["members"][1]["fstype_flag_labels"],
+                         ["bitmap-only"])
+
+    def test_reserved_bits_recomputed_with_corrected_mask(self):
+        # 旧掩码 0xFEF1 把 bit9(0x0200) 当保留位；修正版 0x0200=bitmap-only
+        ev = {"members": [{"member_index": 0, "fstype": 0x0200,
+                           "fstype_flags": [], "fstype_flag_labels": [],
+                           "fstype_reserved_bits": 0x0200}]}
+        out = fl.normalize_evidence_fstype(ev)["members"][0]
+        self.assertEqual(out["fstype_flags"], [0x0200])
+        self.assertEqual(out["fstype_flag_labels"], ["bitmap-only"])
+        self.assertEqual(out["fstype_reserved_bits"], 0)
+
+    def test_missing_fstype_yields_empty_derived(self):
+        ev = {"members": [{"member_index": 0, "fstype": None,
+                           "fstype_flags": [0x0002],
+                           "fstype_flag_labels": ["preview-print-only"],
+                           "fstype_reserved_bits": 7}]}
+        out = fl.normalize_evidence_fstype(ev)["members"][0]
+        self.assertEqual(out["fstype_flags"], [])
+        self.assertEqual(out["fstype_flag_labels"], [])
+        self.assertEqual(out["fstype_reserved_bits"], 0)
+
+    def test_empty_or_missing_members_passthrough(self):
+        self.assertEqual(fl.normalize_evidence_fstype({}), {})
+        ev = {"container": "sfnt", "members": []}
+        self.assertEqual(fl.normalize_evidence_fstype(ev), ev)
+
+    def test_other_fields_preserved(self):
+        ev = self._legacy_evidence()
+        out = fl.normalize_evidence_fstype(ev)
+        self.assertEqual(out["container"], "ttc")
+        self.assertEqual(out["unpack_summary"], ev["unpack_summary"])
+        self.assertEqual(out["members"][0]["sha256"], "a" * 64)
+        self.assertEqual(out["members"][0]["member_index"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

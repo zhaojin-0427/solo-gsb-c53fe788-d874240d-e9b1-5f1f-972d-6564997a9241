@@ -114,6 +114,46 @@ def fstype_reserved_bits(value: int) -> int:
     return value & FSTYPE_RESERVED_MASK
 
 
+def recompute_member_fstype(member: dict[str, Any]) -> dict[str, Any]:
+    """以数值 fstype 为准重算成员的派生字段，返回新 dict（不改原对象）。
+
+    升级前登记的存证仍按旧位序记录派生字段：0x0002 被误标为
+    preview-print-only、0x0100 被误标为 bitmap-only，保留位也按旧掩码
+    0xFEF1 计算。读取存证时一律以数值 fsType 按修正版位定义重算
+    fstype_flags / fstype_flag_labels / fstype_reserved_bits 三个派生字段。
+    """
+    m = dict(member)
+    fs_type = m.get("fstype")
+    if not isinstance(fs_type, int) or isinstance(fs_type, bool):
+        # 无数值 fsType（如缺 OS/2 表）：派生字段无从谈起，置空
+        m["fstype_flags"] = []
+        m["fstype_flag_labels"] = []
+        m["fstype_reserved_bits"] = 0
+        return m
+    flags = fstype_flags(fs_type)
+    m["fstype_flags"] = flags
+    m["fstype_flag_labels"] = [FSTYPE_FLAG_LABELS[b] for b in flags]
+    m["fstype_reserved_bits"] = fstype_reserved_bits(fs_type)
+    return m
+
+
+def normalize_evidence_fstype(evidence: dict[str, Any]) -> dict[str, Any]:
+    """在副本中重算全部成员（含 TTC 集合成员）的 fsType 派生字段。
+
+    用于评估、发布与许可摘要的存证读取路径，使逐条证据、新冻结清单与
+    页面呈现统一以数值 fsType 为准；数据库中的原始存证与历史冻结决定
+    保持原貌，绝不改写。
+    """
+    if not isinstance(evidence, dict):
+        return evidence
+    members = evidence.get("members")
+    if not members:
+        return evidence
+    out = dict(evidence)
+    out["members"] = [recompute_member_fstype(m) for m in members]
+    return out
+
+
 def _name_record_unicode(ft: TTFont, name_id: int) -> str:
     """按 Windows English(0x409) → Mac Roman → 任意可解码的优先级取 name 字符串。"""
     if "name" not in ft:

@@ -22,6 +22,7 @@ from .font_loader import (
     FSTYPE_PREVIEW,
     FSTYPE_RESERVED_MASK,
     FSTYPE_RESTRICTED,
+    normalize_evidence_fstype,
 )
 
 MANIFEST_KIND = "font-asset-license-embedding-gate"
@@ -349,6 +350,8 @@ def evaluate(policy_record: dict[str, Any],
 
     policy_record: database.get_active_license_policy 返回的完整不可变记录
     stack: [{"position", "sha256", "filename", "family", "evidence"}]
+           证据中的 fsType 派生标签在副本中按数值 fstype 重算（修正版位
+           定义），调用方对象不被改写
     exemptions: 该 scenario + policy_version 下的豁免（含已撤销/过期，引擎判定）
     返回自包含清单（manifest，不含 fingerprint 之外的外层包装）。
     """
@@ -357,6 +360,14 @@ def evaluate(policy_record: dict[str, Any],
     scenario = policy_record["scenario"]
     version = policy_record["version"]
     policy = policy_record["policy"]
+
+    # 以数值 fsType 为准，在副本中重算每个成员的派生标签：升级前登记的
+    # 存证可能仍按旧位序标记（如 0x0002 被记为 preview-print-only）。
+    # 数值检查、标签冲突规则、逐条证据与冻结清单统一使用重算后的证据；
+    # 调用方对象与数据库原始存证不被改写。
+    stack = [{**font,
+              "evidence": normalize_evidence_fstype(font.get("evidence") or {})}
+             for font in stack]
 
     findings: list[dict[str, Any]] = []
 

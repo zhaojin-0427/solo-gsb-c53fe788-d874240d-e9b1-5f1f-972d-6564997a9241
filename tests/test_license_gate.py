@@ -353,6 +353,125 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual(m1, m2)
 
 
+class LegacyEvidenceRecomputeTests(unittest.TestCase):
+    """升级前登记的存证（旧位序派生标签）：评估以数值 fsType 为准，
+    在副本中重算 fstype_flags/labels/reserved_bits，原始对象不改写。"""
+
+    def test_legacy_0x0002_preview_label_recomputed(self):
+        # 旧存证：fstype=0x0002 但派生标签仍记为 preview-print-only
+        st = stack1(fstype=0x0002,
+                    fstype_flags=[0x0002],
+                    fstype_flag_labels=["preview-print-only"],
+                    fstype_reserved_bits=0,
+                    name_license_description="Proprietary",
+                    name_license_url="https://example.com/lic")
+        m = lg.evaluate(POLICY, st, [], NOW)
+        self.assertEqual(m["decision"], "deny")
+        self.assertIn(lg.FSTYPE_BIT_FORBIDDEN, m["deny_codes"])
+        # 冻结清单中的标签以数值为准
+        labels = m["font_stack"][0]["license_evidence"]["members"][0][
+            "fstype_flag_labels"]
+        self.assertEqual(labels, ["restricted"])
+        # 逐条证据中的标签同步重算，结论与证据不再矛盾
+        finding = next(f for f in m["findings"]
+                       if f["code"] == lg.FSTYPE_BIT_FORBIDDEN)
+        self.assertEqual(finding["evidence"]["fstype_flag_labels"],
+                         ["restricted"])
+        # 调用方传入的原始证据对象不被改写
+        self.assertEqual(
+            st[0]["evidence"]["members"][0]["fstype_flag_labels"],
+            ["preview-print-only"])
+
+    def test_legacy_reserved_bits_recomputed_with_corrected_mask(self):
+        # 旧掩码 0xFEF1 把 bit9(0x0200) 当保留位；修正版 0x0200=bitmap-only
+        st = stack1(fstype=0x0200,
+                    fstype_flags=[],
+                    fstype_flag_labels=[],
+                    fstype_reserved_bits=0x0200,
+                    name_license_description="OFL",
+                    name_license_url="https://x.test")
+        m = lg.evaluate(POLICY, st, [], NOW)
+        member0 = m["font_stack"][0]["license_evidence"]["members"][0]
+        self.assertEqual(member0["fstype_flags"], [0x0200])
+        self.assertEqual(member0["fstype_flag_labels"], ["bitmap-only"])
+        self.assertEqual(member0["fstype_reserved_bits"], 0)
+        # 不再误报保留位（但 0x0200 不在 Web 允许掩码中，仍拒绝）
+        self.assertNotIn(lg.FSTYPE_RESERVED_BITS, m["deny_codes"])
+        self.assertIn(lg.FSTYPE_MASK_NOT_ALLOWED, m["deny_codes"])
+
+    def test_legacy_ttc_all_members_recomputed(self):
+        m0 = member(member_index=0, fstype=0x0100,
+                    fstype_flags=[0x0100],
+                    fstype_flag_labels=["bitmap-only"])  # 旧位序误标
+        m1 = member(member_index=1, sha256="c" * 64, fstype=0x0002,
+                    fstype_flags=[0x0002],
+                    fstype_flag_labels=["preview-print-only"],
+                    name_license_description="Other",
+                    name_license_url="https://c.test/x")
+        st = [font("a" * 64, [m0, m1], container="ttc")]
+        m = lg.evaluate(POLICY, st, [], NOW)
+        members = m["font_stack"][0]["license_evidence"]["members"]
+        self.assertEqual(members[0]["fstype_flag_labels"], ["no-subsetting"])
+        self.assertEqual(members[1]["fstype_flag_labels"], ["restricted"])
+        # 原始对象未被改写
+        self.assertEqual(m0["fstype_flag_labels"], ["bitmap-only"])
+        self.assertEqual(m1["fstype_flag_labels"], ["preview-print-only"])
+
+    def test_legacy_label_no_false_stack_conflict(self):
+        # 0x0002（旧标 preview-print-only）与 editable 字体不再误命中
+        # preview/editable 栈冲突：数值为准后 0x0002=restricted
+        f1 = font("a" * 64, [member(
+            fstype=0x0002, fstype_flags=[0x0002],
+            fstype_flag_labels=["preview-print-only"],
+            name_license_description="R", name_license_url="https://a.test")])
+        f1["position"] = 0
+        f2 = font("b" * 64, [member(
+            fstype=0x0008, fstype_flags=[0x0008],
+            fstype_flag_labels=["editable"],
+            name_license_description="E", name_license_url="https://b.test")])
+        f2["position"] = 1
+        pol = {**POLICY}
+        pol["policy"] = {**POLICY["policy"],
+                         "allowed_fstype_masks": [0x0002, 0x0008],
+                         "forbidden_fstype_bits": []}
+        m = lg.evaluate(pol, [f1, f2], [], NOW)
+        self.assertNotIn(lg.STACK_LICENSE_CONFLICT, m["deny_codes"],
+                         m["findings"])
+
+    def test_true_preview_still_conflicts_with_editable(self):
+        # 真正的 0x0004 preview&print（旧存证曾误标为 editable）仍命中冲突
+        f1 = font("a" * 64, [member(
+            fstype=0x0004, fstype_flags=[0x0004],
+            fstype_flag_labels=["editable"],  # 旧位序误标
+            name_license_description="P", name_license_url="https://a.test")])
+        f1["position"] = 0
+        f2 = font("b" * 64, [member(
+            fstype=0x0008, fstype_flags=[0x0008],
+            fstype_flag_labels=["editable"],
+            name_license_description="E", name_license_url="https://b.test")])
+        f2["position"] = 1
+        pol = {**POLICY}
+        pol["policy"] = {**POLICY["policy"],
+                         "allowed_fstype_masks": [0x0004, 0x0008],
+                         "forbidden_fstype_bits": []}
+        m = lg.evaluate(pol, [f1, f2], [], NOW)
+        self.assertIn(lg.STACK_LICENSE_CONFLICT, m["deny_codes"])
+
+    def test_recompute_does_not_change_fingerprint(self):
+        # 指纹只含成员摘要/容器/解包摘要：同一字体新旧存证标签指纹一致
+        legacy = stack1(fstype=0x0002, fstype_flags=[0x0002],
+                        fstype_flag_labels=["preview-print-only"],
+                        name_license_description="P",
+                        name_license_url="https://x.test")
+        fixed = stack1(fstype=0x0002, fstype_flags=[0x0002],
+                       fstype_flag_labels=["restricted"],
+                       name_license_description="P",
+                       name_license_url="https://x.test")
+        m1 = lg.evaluate(POLICY, legacy, [], NOW)
+        m2 = lg.evaluate(POLICY, fixed, [], NOW)
+        self.assertEqual(m1["fingerprint"], m2["fingerprint"])
+
+
 class ValidationTests(unittest.TestCase):
     def test_valid_policy(self):
         lg.validate_policy(POLICY["policy"])  # 不抛异常

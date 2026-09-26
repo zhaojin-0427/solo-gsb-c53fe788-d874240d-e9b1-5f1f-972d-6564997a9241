@@ -571,6 +571,9 @@ def api_font_license_evidence(digest: str) -> dict[str, Any]:
     if not evidence:
         from .font_loader import license_evidence_from_sfnt
         evidence = license_evidence_from_sfnt(path.read_bytes(), digest)
+    # 以数值 fsType 为准，在副本中重算派生标签（升级前登记的存证可能
+    # 仍按旧位序标记）；数据库中的原始存证保持原貌，不改写
+    evidence = font_loader.normalize_evidence_fstype(evidence)
     return {"sha256": digest,
             "summary": license_gate.summarize_evidence(evidence),
             "evidence": evidence}
