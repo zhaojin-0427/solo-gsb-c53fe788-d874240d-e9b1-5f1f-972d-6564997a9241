@@ -1,0 +1,13 @@
+services:
+  glyph-review:
+    build: .
+    image: glyph-fallback-review:latest
+    container_name: glyph-fallback-review
+    ports:
+      - "8000:8000"
+    volumes:
+      - glyph-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  glyph-data:

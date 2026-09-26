@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>字体回退与字形审查台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>字体回退与字形审查台</h1>
+  <span class="subtitle">Grapheme-cluster font fallback &amp; glyph audit — HarfBuzz</span>
+  <span id="health" class="health" title="后端状态"></span>
+</header>
+
+<main class="layout">
+  <!-- ===================== 左栏：配置 ===================== -->
+  <section class="panel config">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-tab="analyze">审查分析</button>
+      <button class="tab" data-tab="fonts">字体库</button>
+      <button class="tab" data-tab="reviews">审查记录</button>
+      <button class="tab" data-tab="gate">许可合规门禁</button>
+    </div>
+
+    <!-- 字体库 -->
+    <div class="tabpane" data-pane="fonts" hidden>
+      <h2>字体上传</h2>
+      <form id="upload-form" class="upload-form">
+        <input type="file" id="font-file" accept=".otf,.ttf,.woff,.woff2,.ttc" required>
+        <button type="submit">上传并解析</button>
+      </form>
+      <p class="hint">支持 OpenType（.otf/.ttf）、WOFF/WOFF2、TTC（取第 0 个字体）。
+        以解包后 sfnt 的 SHA-256 作为字体身份；上限 50MB。</p>
+      <div id="upload-msg" class="msg"></div>
+      <h2>已安装字体（<span id="font-count">0</span>）</h2>
+      <div id="font-list" class="font-list"></div>
+    </div>
+
+    <!-- 分析配置 -->
+    <div class="tabpane" data-pane="analyze">
+      <h2>输入文本</h2>
+      <textarea id="text-input" rows="4" spellcheck="false">Hello fi! é q́ مرحبا אבג 你好 🎉️</textarea>
+
+      <h2>字体栈（按优先级）</h2>
+      <ul id="stack-list" class="stack-list"></ul>
+      <p class="hint" id="stack-hint">请先到「字体库」上传字体，再点击 ➕ 加入字体栈。</p>
+
+      <div class="grid2">
+        <label>语言
+          <input id="cfg-language" type="text" value="auto"
+                 placeholder="en / zh-Hans / ar / he …">
+        </label>
+        <label>书写系统
+          <select id="cfg-script">
+            <option value="">自动（按 UAX #24）</option>
+          </select>
+        </label>
+        <label>书写方向
+          <select id="cfg-direction">
+            <option value="auto">自动（UBA 段落基方向）</option>
+            <option value="ltr">LTR 左→右</option>
+            <option value="rtl">RTL 右→左</option>
+            <option value="ttb">TTB 竖排（自上而下）</option>
+          </select>
+        </label>
+        <label>Unicode 规范化
+          <select id="cfg-normalize">
+            <option value="none">不规范化（按原始输入）</option>
+            <option value="nfc">NFC</option>
+            <option value="nfkc">NFKC</option>
+          </select>
+        </label>
+      </div>
+
+      <h2>OpenType 特性开关</h2>
+      <div class="features-bar">
+        <input id="feature-tag" type="text" maxlength="4" minlength="4"
+               placeholder="4 字母特性标签，如 smcp" style="width:9em">
+        <button type="button" id="feature-add-on">添加强制开启</button>
+        <button type="button" id="feature-add-off">添加强制关闭</button>
+      </div>
+      <div class="feature-presets" id="feature-presets"></div>
+      <ul id="feature-list" class="feature-list"></ul>
+      <p class="hint">默认启用 HarfBuzz 常规特性（liga/calt/kern/mark/isol/fina/medi/init…）；
+        关闭 <code>liga</code> 可观察 fi 等连字消失。</p>
+
+      <div class="actions">
+        <button id="btn-analyze" class="primary">开始审查</button>
+        <label class="save-toggle">
+          <input type="checkbox" id="save-review"> 保存为审查记录
+        </label>
+        <input type="text" id="review-title" placeholder="记录标题（可选）"
+               style="flex:1; min-width:10em">
+      </div>
+      <div id="analyze-msg" class="msg"></div>
+    </div>
+
+    <!-- 审查记录 -->
+    <div class="tabpane" data-pane="reviews" hidden>
+      <h2>已保存的审查记录</h2>
+      <p class="hint">记录固定了请求参数与字体摘要（SHA-256、字形数、cmap 数等）。
+        只要字体文件未变，相同输入必然产生一致结果；可用「重新执行」比对复核。</p>
+      <div id="review-list" class="review-list"></div>
+    </div>
+
+    <!-- 许可合规门禁 -->
+    <div class="tabpane" data-pane="gate" hidden>
+      <h2>使用场景</h2>
+      <div class="gate-scenarios" id="gate-scenarios">
+        <button type="button" class="scenario-btn active" data-scenario="web">🌐 Web</button>
+        <button type="button" class="scenario-btn" data-scenario="desktop">🖥 桌面</button>
+        <button type="button" class="scenario-btn" data-scenario="print">🖨 印刷</button>
+      </div>
+
+      <h2>策略版本（不可变）</h2>
+      <div id="gate-policy" class="gate-policy"></div>
+
+      <h2>登记新版本</h2>
+      <details class="gate-editor">
+        <summary class="hint">展开策略编辑器（版本号由服务端线性分配，CAS 发布）</summary>
+        <div class="grid2" style="margin-top:8px">
+          <label>CAS 基准（当前生效版本）
+            <input type="number" id="np-expected" min="0" value="1" style="font-family:var(--mono)">
+          </label>
+          <label>登记人
+            <input type="text" id="np-by" value="admin" style="font-family:inherit">
+          </label>
+        </div>
+        <div class="gate-checkrows" id="np-flags"></div>
+        <label class="block-label">allowed_fstype_masks（十六进制，逗号分隔）
+          <input type="text" id="np-masks" value="0x0000, 0x0100">
+        </label>
+        <label class="block-label">forbidden_fstype_bits（十六进制，逗号分隔）
+          <input type="text" id="np-bits" value="0x0002">
+        </label>
+        <label class="block-label">required_name_fields
+          <div class="gate-checkrows" id="np-namefields"></div>
+        </label>
+        <label class="block-label">forbidden_license_patterns（正则，每行一条）
+          <textarea id="np-patterns" rows="2" placeholder="例如:\nbuy[- ]?only|proprietary"></textarea>
+        </label>
+        <label class="block-label">conflict_rules（JSON 数组，高级）
+          <textarea id="np-rules" rows="3" placeholder='[{"type":"fstype-flag-pair","flag_a":"preview-print-only","flag_b":"editable","message":"…"}]'></textarea>
+        </label>
+        <div class="actions">
+          <button type="button" id="np-submit" class="primary">校验并发布新版本（CAS）</button>
+          <button type="button" id="np-draft-only">仅登记不激活</button>
+        </div>
+        <div id="np-msg" class="msg"></div>
+      </details>
+
+      <h2>合规检查字体栈</h2>
+      <ul id="gate-stack-list" class="stack-list"></ul>
+      <div id="gate-font-picker" class="gate-picker"></div>
+      <div class="actions">
+        <button type="button" id="gate-evaluate" class="primary">即时评估（不冻结）</button>
+        <button type="button" id="gate-publish">发布冻结决定</button>
+        <input type="text" id="gate-request-id" placeholder="幂等键 request_id（可选）"
+               style="flex:1;min-width:10em;font-family:var(--mono);font-size:11.5px">
+      </div>
+      <div id="gate-msg" class="msg"></div>
+
+      <h2>豁免（带理由与到期时间）</h2>
+      <details class="gate-editor">
+        <summary class="hint">为当前策略版本下的具体字体登记豁免</summary>
+        <div class="grid2" style="margin-top:8px">
+          <label>字体
+            <select id="ex-font"></select>
+          </label>
+          <label>到期时间（留空=长期）
+            <input type="datetime-local" id="ex-expires" style="font-family:inherit">
+          </label>
+        </div>
+        <label class="block-label">豁免的检查代码（逗号分隔；* = 全部）
+          <input type="text" id="ex-codes" value="*" style="font-family:var(--mono)">
+        </label>
+        <label class="block-label">是否可豁免字体栈组合冲突
+          <input type="checkbox" id="ex-stack">
+        </label>
+        <label class="block-label">理由（必填）
+          <textarea id="ex-why" rows="2" placeholder="例：已与版权方签订 2026 年度 Web 嵌入授权 #LIC-123"></textarea>
+        </label>
+        <div class="actions">
+          <button type="button" id="ex-submit">登记豁免</button>
+        </div>
+        <div id="ex-msg" class="msg"></div>
+      </details>
+      <div id="gate-exemptions" class="gate-exemptions"></div>
+
+      <h2>已冻结决定</h2>
+      <div id="gate-decisions" class="gate-decisions"></div>
+    </div>
+  </section>
+
+  <!-- ===================== 右栏：结果 ===================== -->
+  <section class="panel results" id="results-panel">
+    <div id="results-empty" class="empty">
+      <p>在左侧输入文本、配置字体栈后点击「开始审查」。</p>
+      <p class="hint">将逐字素簇展示：实际命中字体、字形编号与名称、
+        前进量/偏移/包围盒、连字合并、回退原因与 bidi 信息。</p>
+    </div>
+
+    <div id="results-content" hidden>
+      <div class="results-head">
+        <h2 id="results-title">审查结果</h2>
+        <div class="result-actions">
+          <button id="btn-rerun" type="button" hidden>重新执行并比对</button>
+          <button id="btn-export" type="button">导出 JSON 报告</button>
+        </div>
+      </div>
+
+      <div id="stats-bar" class="stats-bar"></div>
+      <div id="meta-bar" class="meta-bar"></div>
+
+      <h3>回退整形尝试（审计轨迹）</h3>
+      <div id="attempts" class="attempts"></div>
+
+      <h3>字素簇序列（<span id="cluster-mode-label">卡片</span>）
+        <button id="view-toggle" type="button" class="small">切换为数据表</button>
+      </h3>
+      <div id="cluster-strip" class="cluster-strip"></div>
+      <div id="cluster-table-wrap" hidden>
+        <table id="cluster-table" class="cluster-table">
+          <thead><tr>
+            <th>#</th><th>簇</th><th>码位</th><th>脚本</th><th>Bidi 级别</th>
+            <th>覆盖</th><th>字体</th><th>栈位</th><th>字形</th><th>连字</th>
+            <th>原因 / 警告</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div id="cluster-detail" class="cluster-detail" hidden></div>
+    </div>
+
+    <!-- 许可门禁结果 -->
+    <div id="gate-result" hidden>
+      <div class="results-head">
+        <h2>字体资产许可与嵌入合规门禁</h2>
+        <div class="result-actions">
+          <span id="gate-frozen-badge" class="frozen-badge" hidden>❄ 已冻结发布</span>
+          <button id="gate-export" type="button" hidden>导出 JSON 清单</button>
+        </div>
+      </div>
+      <div id="gate-result-body"></div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+<script src="/static/gate.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+data/app.db
+data/fonts/*
+!data/fonts/.gitkeep
+*.log

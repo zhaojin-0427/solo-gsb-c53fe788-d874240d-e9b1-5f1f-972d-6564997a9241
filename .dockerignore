@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+data/app.db
+data/fonts/*.otf
+data/fonts/*.ttf
+data/fonts/*.woff
+data/fonts/*.woff2
+*.log
+.venv/
