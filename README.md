@@ -66,6 +66,13 @@
     系统保留 v1 不可变登记事实（供历史冻结按原版本复核），**追加修正版 v2
     并通过 CAS 切换生效**；逐条证据、冻结清单与幂等发布此后统一引用 v2，
     历史冻结决定绝不重算。
+  - **存量错标存证的读取时校正**：升级前登记的字体，其存证派生字段
+    （`fstype_flags` / `fstype_flag_labels` / `fstype_reserved_bits`）可能
+    仍按旧位序错标（数值 `fsType=0x0002` 却记为 `preview-print-only`）。
+    读取存证用于**评估、发布与许可摘要**时，系统以数值 `fsType` 为准，
+    在副本中按修正版位定义重算每个成员（含 TTC 全部成员）的派生字段，
+    使逐条证据、冻结清单与页面呈现同结论一致；数据库中的原始存证不改写，
+    此前冻结的决定与其 JSON 导出保持原貌、绝不重算。
   - 首次启动自动为三个场景登记 v1 历史基线并追加激活修正版 **v2**
     （生效版本为 v2）。
 
@@ -86,6 +93,9 @@ docker compose up --build
 
 - 上传的字体与 SQLite 数据库保存在 Docker 卷 `glyph-data`（容器内 `/app/data`），
   容器重建后数据仍在（门禁策略版本、豁免与冻结决定同库存放）。
+- 复核新旧记录：门禁页「已冻结决定」区可复核/导出历史冻结清单（保持冻结时
+  原貌）；`/api/fonts` 返回原始存证，`/api/fonts/{sha256}/license-evidence`
+  返回按数值 fsType 重算后的摘要副本，二者可对照查看升级前的错标与修正结果。
 - 停止：`docker compose down`（加 `-v` 可同时删除数据卷）。
 
 ## 方式二：本地直接运行
@@ -270,6 +280,15 @@ curl -X POST http://localhost:8000/api/license/exemptions \
   标记 `reconstructed`。评估/发布前重新对磁盘文件计算 SHA-256 并与登记摘要
   比对，**摘要漂移直接产生 `font-digest-mismatch` 拒绝项**（证据中保留
   claimed/actual 双摘要）。
+- **存证读取校正（升级兼容）**：`fonts.license_evidence` 中的原始存证一经
+  写入不再改写；但升级前登记的派生字段可能按旧位序错标。评估 / 发布与
+  许可摘要（`/api/fonts/{sha256}/license-evidence`）读取存证时，调用
+  `font_loader.normalize_evidence_fstype` 在深拷贝副本中以数值 `fstype`
+  为准重算全部成员（含 TTC 全体成员）的 `fstype_flags`、
+  `fstype_flag_labels` 与 `fstype_reserved_bits`——新证据、新清单与页面
+  摘要因此始终同数值 fsType 一致（栈冲突规则也不会再被旧标签误触发）。
+  字体列表 `/api/fonts` 仍返回原始存证，历史冻结决定与其导出按冻结时
+  原样返回，便于对照复核新旧记录。
 - **确定性与幂等**：同一策略版本 + 同一栈内容（所有 TTC 成员摘要、容器与
   解包摘要）→ 同一 SHA-256 指纹；评估是纯函数（`evaluated_at` 可注入固定
   时间）。发布以 `(request_id 唯一, fingerprint 唯一)` 双重幂等：同键或同内容
@@ -290,7 +309,8 @@ app/
   main.py          FastAPI 路由（字体/分析/记录 + 许可门禁策略/豁免/评估/发布）
   shaper.py        字素簇切分、UBA、HarfBuzz 整形与逐簇回退引擎
   analyzer.py      分析编排与报告结构
-  font_loader.py   字体解包/摘要/cmap/UVS、fsType 与 name 许可证据/TTC 成员枚举
+  font_loader.py   字体解包/摘要/cmap/UVS、fsType 与 name 许可证据/TTC 成员枚举、
+                   存证派生字段读取时重算（normalize_evidence_fstype）
   license_gate.py  许可门禁：策略校验、fsType/字段/冲突规则引擎、豁免、指纹
   database.py      SQLite 持久化（审查记录 + 策略/豁免/冻结决定，gzip 快照）
   models.py        请求模型

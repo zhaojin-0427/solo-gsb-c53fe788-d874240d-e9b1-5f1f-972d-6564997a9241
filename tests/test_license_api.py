@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -519,6 +520,222 @@ class LicenseGateApiTests(unittest.TestCase):
         # 恢复后立即放行
         m = self._eval("desktop", [self.mono]).json()["manifest"]
         self.assertEqual(m["decision"], "allow", m["findings"])
+
+    # ------------------------------------------- 升级前错标存证的读取时校正
+
+    @staticmethod
+    def _legacy_fstype_derivation(value):
+        """升级前旧位序：把 4 位嵌入类型枚举值错按独立位位置解读。"""
+        legacy = {0x0001: "restricted", 0x0002: "preview-print-only",
+                  0x0004: "editable", 0x0008: "no-subsetting",
+                  0x0100: "bitmap-only"}
+        flags = [b for b in legacy if value & b]
+        return flags, [legacy[b] for b in flags]
+
+    @classmethod
+    def _make_evidence_stale(cls, digest):
+        """把已登记字体的存证派生字段改写为旧位序（模拟升级前登记）。
+
+        返回原始存证 JSON，调用方须在 finally 中恢复。
+        """
+        with database.get_conn() as conn:
+            row = conn.execute(
+                "SELECT license_evidence FROM fonts WHERE sha256=?",
+                (digest,)).fetchone()
+            original = row["license_evidence"]
+            ev = json.loads(original)
+            for m in ev.get("members", []):
+                fs = m.get("fstype")
+                if fs is None:
+                    continue
+                flags, labels = cls._legacy_fstype_derivation(fs)
+                m["fstype_flags"] = flags
+                m["fstype_flag_labels"] = labels
+                # 旧保留位掩码 0xFEF0：bit0/bit8 被当作标志位，未计入保留位
+                m["fstype_reserved_bits"] = fs & 0xFEF0
+            conn.execute(
+                "UPDATE fonts SET license_evidence=? WHERE sha256=?",
+                (json.dumps(ev, ensure_ascii=False), digest))
+        return original
+
+    @staticmethod
+    def _restore_evidence(digest, original_json):
+        with database.get_conn() as conn:
+            conn.execute(
+                "UPDATE fonts SET license_evidence=? WHERE sha256=?",
+                (original_json, digest))
+
+    def test_60_stale_registered_evidence_normalized_on_evaluate(self):
+        # 模拟升级前登记：数值 fsType=0x0002，派生字段仍按旧位序错标
+        original = self._make_evidence_stale(self.restricted_digest)
+        try:
+            stored = database.get_font(self.restricted_digest)
+            m0 = stored["license_evidence"]["members"][0]
+            self.assertEqual(m0["fstype"], 0x0002)
+            self.assertEqual(m0["fstype_flag_labels"], ["preview-print-only"])
+
+            m = self._eval("print", [self.restricted_digest]).json()["manifest"]
+            self.assertEqual(m["decision"], "deny")
+            self.assertIn("fstype-bit-forbidden", m["deny_codes"])
+            # 逐条证据与清单中的标签以数值 fsType 为准（restricted）
+            finding = next(f for f in m["findings"]
+                           if f["code"] == "fstype-bit-forbidden")
+            self.assertEqual(finding["evidence"]["fstype_flag_labels"],
+                             ["restricted"])
+            self.assertEqual(finding["evidence"]["fstype_reserved_bits"], 0)
+            member = m["font_stack"][0]["license_evidence"]["members"][0]
+            self.assertEqual(member["fstype"], 0x0002)
+            self.assertEqual(member["fstype_flags"], [0x0002])
+            self.assertEqual(member["fstype_flag_labels"], ["restricted"])
+            self.assertNotIn("preview-print-only",
+                             member["fstype_flag_labels"])
+        finally:
+            self._restore_evidence(self.restricted_digest, original)
+
+    def test_61_stale_ttc_all_members_normalized(self):
+        # 集合字体：成员 0 fsType=0x0002、成员 1 fsType=0x0101（bit0 保留值
+        # + bit8），存证派生字段全部按旧位序错标，评估时全体成员一并重算
+        ft0 = TTFont(SYS / "DejaVuSans.ttf")
+        ft0["OS/2"].fsType = 0x0002
+        ft1 = TTFont(SYS / "DejaVuSans.ttf")
+        ft1["OS/2"].fsType = 0x0101
+        col = TTCollection()
+        col.fonts = [ft0, ft1]
+        buf = io.BytesIO()
+        col.save(buf)
+        r = self.client.post("/api/fonts", files={
+            "file": ("stale-coll.ttc", io.BytesIO(buf.getvalue()),
+                     "font/collection")})
+        self.assertEqual(r.status_code, 200, r.text)
+        digest = r.json()["sha256"]
+        original = self._make_evidence_stale(digest)
+        try:
+            stored = database.get_font(digest)["license_evidence"]
+            self.assertEqual(
+                [m["fstype_flag_labels"] for m in stored["members"]],
+                [["preview-print-only"], ["restricted", "bitmap-only"]])
+            # 旧掩码未把 bit0 计入保留位
+            self.assertEqual(stored["members"][1]["fstype_reserved_bits"], 0)
+
+            m = self._eval("desktop", [digest]).json()["manifest"]
+            members = m["font_stack"][0]["license_evidence"]["members"]
+            self.assertEqual(len(members), 2)
+            self.assertEqual(members[0]["fstype_flag_labels"], ["restricted"])
+            self.assertEqual(members[1]["fstype_flag_labels"],
+                             ["no-subsetting"])
+            # bit0 是保留位：重算后出现在 fstype_reserved_bits 中
+            self.assertEqual(members[1]["fstype_reserved_bits"], 0x0001)
+        finally:
+            self._restore_evidence(digest, original)
+
+    def test_62_stale_labels_do_not_trigger_false_stack_conflict(self):
+        # 旧标签 preview-print-only 若直接参与栈冲突规则，会与 editable 字体
+        # 误报 stack-license-conflict；重算后 0x0002=restricted 不应命中
+        ft = TTFont(SYS / "DejaVuSans.ttf")
+        ft["OS/2"].fsType = 0x0008  # editable
+        buf = io.BytesIO()
+        ft.save(buf)
+        r = self.client.post("/api/fonts", files={
+            "file": ("Editable.ttf", io.BytesIO(buf.getvalue()), "font/sfnt")})
+        self.assertEqual(r.status_code, 200, r.text)
+        editable_digest = r.json()["sha256"]
+
+        original = self._make_evidence_stale(self.restricted_digest)
+        try:
+            m = self._eval("web", [self.restricted_digest,
+                                   editable_digest]).json()["manifest"]
+            codes = {f["code"] for f in m["findings"]}
+            self.assertNotIn("stack-license-conflict", codes)
+            # 结论不变：0x0002 仍按 restricted 拒绝
+            self.assertIn("fstype-bit-forbidden", codes)
+        finally:
+            self._restore_evidence(self.restricted_digest, original)
+
+    def test_63_publish_and_license_summary_use_corrected_labels(self):
+        original = self._make_evidence_stale(self.restricted_digest)
+        try:
+            # 发布冻结：清单内证据按数值 fsType 重算（restricted）
+            r = self.client.post("/api/license/publish", json={
+                "scenario": "desktop",
+                "font_stack": [self.restricted_digest],
+                "request_id": "release-stale-label-normalized"})
+            self.assertEqual(r.status_code, 201, r.text)
+            m = r.json()["manifest"]
+            self.assertEqual(m["decision"], "deny")
+            member = m["font_stack"][0]["license_evidence"]["members"][0]
+            self.assertEqual(member["fstype"], 0x0002)
+            self.assertEqual(member["fstype_flag_labels"], ["restricted"])
+            self.assertEqual(member["fstype_reserved_bits"], 0)
+            # 冻结决定详情同样呈现修正后的标签
+            did = r.json()["decision_id"]
+            rec = self.client.get(f"/api/license/decisions/{did}").json()
+            self.assertEqual(
+                rec["manifest"]["font_stack"][0]["license_evidence"]
+                   ["members"][0]["fstype_flag_labels"], ["restricted"])
+            # 许可摘要端点（页面摘要数据源）同步修正
+            ev = self.client.get(
+                f"/api/fonts/{self.restricted_digest}/license-evidence").json()
+            self.assertEqual(ev["summary"]["fstype_flag_labels"],
+                             ["restricted"])
+            self.assertEqual(ev["summary"]["fstype_reserved_bits"], 0)
+            self.assertEqual(
+                ev["evidence"]["members"][0]["fstype_flag_labels"],
+                ["restricted"])
+            # 原始存证不改写：数据库中仍是旧标签
+            stored = database.get_font(self.restricted_digest)
+            self.assertEqual(
+                stored["license_evidence"]["members"][0]
+                      ["fstype_flag_labels"], ["preview-print-only"])
+        finally:
+            self._restore_evidence(self.restricted_digest, original)
+
+    def test_64_historical_frozen_decision_and_export_keep_original(self):
+        # 修复前冻结的决定（证据内仍是旧标签）必须原样可取，绝不重算
+        stale_manifest = {
+            "manifest": "font-asset-license-embedding-gate",
+            "schema_version": "1.0",
+            "scenario": "print",
+            "evaluated_at": "2026-09-01T00:00:00+00:00",
+            "decision": "allow",
+            "deny_codes": [],
+            "policy": {"scenario": "print", "version": 1,
+                       "created_at": "2026-09-01T00:00:00+00:00",
+                       "registered_by": "system-bootstrap", "rules": {}},
+            "font_stack": [{
+                "position": 0, "sha256": self.restricted_digest,
+                "filename": "Restricted.ttf", "family": "DejaVu Sans",
+                "license_evidence": {
+                    "container": "sfnt", "members_complete": True,
+                    "members": [{
+                        "member_index": 0, "sha256": self.restricted_digest,
+                        "fstype": 0x0002,
+                        "fstype_flags": [0x0002],
+                        "fstype_flag_labels": ["preview-print-only"],
+                        "fstype_reserved_bits": 0}]}}],
+            "exemptions_considered": [], "exemptions_applied": [],
+            "findings": [],
+            "fingerprint": "d" * 64,
+        }
+        did, created = database.insert_license_decision(
+            request_id="legacy-frozen-stale-labels",
+            fingerprint="d" * 64, scenario="print", policy_version=1,
+            font_stack=[self.restricted_digest], manifest=stale_manifest)
+        self.assertTrue(created)
+
+        rec = self.client.get(f"/api/license/decisions/{did}").json()
+        member = rec["manifest"]["font_stack"][0]["license_evidence"]
+        member = member["members"][0]
+        self.assertEqual(member["fstype_flag_labels"], ["preview-print-only"])
+        self.assertEqual(rec["manifest"]["decision"], "allow")
+        self.assertEqual(rec["manifest"]["policy"]["version"], 1)
+
+        exp = self.client.get(f"/api/license/decisions/{did}/export")
+        self.assertEqual(exp.status_code, 200)
+        exported = exp.json()
+        self.assertEqual(
+            exported["font_stack"][0]["license_evidence"]["members"][0]
+                    ["fstype_flag_labels"], ["preview-print-only"])
+        self.assertEqual(exported["decision"], "allow")
 
 
 if __name__ == "__main__":

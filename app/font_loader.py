@@ -1,6 +1,7 @@
 """字体加载、摘要计算与元数据提取（fontTools + uharfbuzz）。"""
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import threading
@@ -112,6 +113,32 @@ def fstype_flags(value: int) -> list[int]:
 
 def fstype_reserved_bits(value: int) -> int:
     return value & FSTYPE_RESERVED_MASK
+
+
+def normalize_evidence_fstype(evidence: dict[str, Any]) -> dict[str, Any]:
+    """以数值 fsType 为准，在副本中重算每个成员的派生字段。
+
+    升级前登记的存证，其 fstype_flags / fstype_flag_labels /
+    fstype_reserved_bits 可能仍按旧位序错标（例如 0x0002 被记为
+    preview-print-only 而非 restricted）。读取存证用于评估、发布与许可
+    摘要时调用本函数：深拷贝证据（数据库中的原始存证与缓存对象均不改写），
+    按修正版位定义重算每个成员的派生字段——集合字体（TTC）的全部成员
+    一并覆盖——使逐条证据、冻结清单与页面摘要同数值 fsType 一致。
+    历史冻结决定及其导出不经过本函数，保持原貌。
+    """
+    normalized = copy.deepcopy(evidence) if evidence else {}
+    for member in normalized.get("members") or []:
+        fs_type = member.get("fstype")
+        if fs_type is None:  # 缺少 OS/2 表：与提取时一致，派生字段为空
+            member["fstype_flags"] = []
+            member["fstype_flag_labels"] = []
+            member["fstype_reserved_bits"] = 0
+            continue
+        flags = fstype_flags(fs_type)
+        member["fstype_flags"] = flags
+        member["fstype_flag_labels"] = [FSTYPE_FLAG_LABELS[b] for b in flags]
+        member["fstype_reserved_bits"] = fstype_reserved_bits(fs_type)
+    return normalized
 
 
 def _name_record_unicode(ft: TTFont, name_id: int) -> str:

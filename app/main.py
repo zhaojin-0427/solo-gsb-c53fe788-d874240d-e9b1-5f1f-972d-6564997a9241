@@ -1,7 +1,6 @@
 """字体回退与字形审查台 — FastAPI 入口。"""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -384,8 +383,11 @@ def _build_gate_stack(digests: list[str]) -> list[dict[str, Any]]:
             if not evidence:
                 from .font_loader import license_evidence_from_sfnt
                 evidence = license_evidence_from_sfnt(disk_bytes, digest)
+        # 以数值 fsType 为准，在副本中重算派生字段：升级前登记的存证可能仍按
+        # 旧位序错标（如 0x0002 记为 preview-print-only）；原始存证不改写
+        evidence = font_loader.normalize_evidence_fstype(evidence)
         if actual != digest:
-            evidence = json.loads(json.dumps(evidence, ensure_ascii=False))
+            # normalize 返回的已是副本，可直接标注漂移（不再触碰共享对象）
             for m in evidence.get("members", []):
                 if m.get("member_index") == 0:
                     m["actual_sha256"] = actual
@@ -571,6 +573,8 @@ def api_font_license_evidence(digest: str) -> dict[str, Any]:
     if not evidence:
         from .font_loader import license_evidence_from_sfnt
         evidence = license_evidence_from_sfnt(path.read_bytes(), digest)
+    # 许可摘要同样以数值 fsType 为准重算派生字段（副本），原始存证不改写
+    evidence = font_loader.normalize_evidence_fstype(evidence)
     return {"sha256": digest,
             "summary": license_gate.summarize_evidence(evidence),
             "evidence": evidence}
